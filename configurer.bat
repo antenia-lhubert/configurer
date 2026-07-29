@@ -781,8 +781,6 @@ goto :eof
 set "DEP_SPEC=%~1"
 set "DEP_NAME="
 set "DEP_MINVER="
-set "DEP_IS_UPDATE=0"
-set "DEP_DID_CHANGE=0"
 
 :: Split name@version
 for /f "tokens=1,2 delims=@" %%A in ("!DEP_SPEC!") do (
@@ -790,10 +788,14 @@ for /f "tokens=1,2 delims=@" %%A in ("!DEP_SPEC!") do (
     set "DEP_MINVER=%%B"
 )
 
-:: Cycle detection
+:: Cycle detection (return early WITHOUT clobbering caller's state)
 echo " !VISITED_DEPS! " | findstr /c:" !DEP_NAME! " >nul 2>&1
 if !ERRORLEVEL! EQU 0 goto :eof
 set "VISITED_DEPS=!VISITED_DEPS! !DEP_NAME!"
+
+:: Initialize AFTER cycle check to avoid clobbering parent's variables
+set "DEP_IS_UPDATE=0"
+set "DEP_DID_CHANGE=0"
 
 :: Check if installed
 if not exist "%INSTALL_DIR%\!DEP_NAME!\." goto :ProcessOneDep_Install
@@ -847,8 +849,23 @@ echo [configurer]   Dependency '!DEP_NAME!' installed.
 set "DEP_DID_CHANGE=1"
 
 :ProcessOneDep_Recurse
+:: Save state with depth counter (batch has no local scope; recursive calls clobber globals)
+if not defined PD_DEPTH set "PD_DEPTH=0"
+set /a "PD_DEPTH+=1"
+for %%i in (!PD_DEPTH!) do (
+    set "PD_NAME_%%i=!DEP_NAME!"
+    set "PD_DID_%%i=!DEP_DID_CHANGE!"
+    set "PD_UPD_%%i=!DEP_IS_UPDATE!"
+)
 :: Recurse into this dep's own dependencies first (depth-first)
 call :ResolveDeps "%INSTALL_DIR%\!DEP_NAME!"
+:: Restore state after recursion
+for %%i in (!PD_DEPTH!) do (
+    set "DEP_NAME=!PD_NAME_%%i!"
+    set "DEP_DID_CHANGE=!PD_DID_%%i!"
+    set "DEP_IS_UPDATE=!PD_UPD_%%i!"
+)
+set /a "PD_DEPTH-=1"
 if !EXITCODE! NEQ 0 goto :eof
 :: Run lifecycle hook only if files were actually installed/updated
 if "!DEP_DID_CHANGE!"=="1" call :RunDepHook "!DEP_NAME!" "!DEP_IS_UPDATE!"

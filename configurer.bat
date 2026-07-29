@@ -58,8 +58,8 @@ setlocal EnableDelayedExpansion
 ::   configurer uninstall my-addon
 :: ============================================================================
 
-set "SCRIPT_URL=https://raw.githubusercontent.com/antenia-lhubert/env-configurer/main/configurer.bat"
-set "OFFICIAL_REPO=PLACEHOLDER_OFFICIAL_REPO_URL"
+set "SCRIPT_URL=https://raw.githubusercontent.com/antenia-lhubert/configurer/main/configurer.bat"
+set "OFFICIAL_REPO=https://github.com/antenia-lhubert/antenia-configurer-repo"
 set "INSTALL_DIR=%USERPROFILE%\.config\configurer\installed"
 set "COMMANDS_DIR=%USERPROFILE%\.config\configurer\commands"
 set "EXITCODE=0"

@@ -1,4 +1,4 @@
-:: Version: 2
+:: Version: 3
 @echo off
 setlocal EnableDelayedExpansion
 
@@ -6,7 +6,8 @@ setlocal EnableDelayedExpansion
 :: configurer.bat - Module-based machine provisioning via git
 ::
 :: Manages addons defined by .configurer.yml files. Addons declare a name,
-:: version, entrypoint command string, optional source URL, and dependencies.
+:: version, entrypoint command string, optional lifecycle hooks (install,
+:: update, uninstall), optional source URL, and dependencies.
 ::
 :: Usage:
 ::   configurer install <target>
@@ -18,24 +19,30 @@ setlocal EnableDelayedExpansion
 :: Subcommands:
 ::   install     Install an addon and its dependencies. Target can be a git URL,
 ::               GitHub browse URL (with subpath), local path, or addon name
-::               (resolved from the official repo).
+::               (resolved from the official repo). Runs the install hook after
+::               dependencies are satisfied.
 ::
 ::   run         Execute an addon's entrypoint. Same resolution as install.
 ::               Missing dependencies are auto-installed before execution.
 ::               All arguments after the target are passed to the entrypoint.
 ::
 ::   update      Re-fetch and reinstall an addon if a newer version is available.
-::               Without a name, updates all installed addons.
+::               Without a name, updates all installed addons. Runs the update
+::               hook after dependencies are re-checked.
 ::
 ::   ls          List all installed addons with their versions.
 ::
-::   uninstall   Remove an installed addon by name.
+::   uninstall   Remove an installed addon by name. Runs the uninstall hook
+::               before deleting files.
 ::
 :: .configurer.yml format:
 ::   apiVersion: 1
 ::   name: my-addon
 ::   version: 1.0.0
 ::   entrypoint: powershell -NoProfile -ExecutionPolicy Bypass -File main.ps1
+::   install: install.cmd
+::   update: install.cmd
+::   uninstall: uninstall.cmd
 ::   source: https://github.com/org/addons/tree/main/my-addon
 ::   dependencies:
 ::     - core-utils
@@ -62,6 +69,7 @@ set "SCRIPT_URL=https://raw.githubusercontent.com/antenia-lhubert/configurer/mai
 set "OFFICIAL_REPO=https://github.com/antenia-lhubert/antenia-configurer-repo"
 set "INSTALL_DIR=%USERPROFILE%\.config\configurer\installed"
 set "COMMANDS_DIR=%USERPROFILE%\.config\configurer\commands"
+set "TIMESTAMP_FILE=%USERPROFILE%\.config\configurer\last_update_check.timestamp"
 set "EXITCODE=0"
 set "TMPDIR="
 set "UPDATE_IN_PROGRESS=0"
@@ -116,6 +124,7 @@ if /i "!SUBCMD!"=="uninstall" goto :CmdUninstall
 if /i "!SUBCMD!"=="install" goto :PreGit
 if /i "!SUBCMD!"=="run" goto :PreGit
 if /i "!SUBCMD!"=="update" goto :PreGit
+if /i "!SUBCMD!"=="self-update" goto :CmdSelfUpdate
 goto :ShowUsage
 
 :: ---------------------------------------------------------------------------
@@ -195,6 +204,19 @@ if not exist "%INSTALL_DIR%\%TARGET%\." (
     )
     exit /b 1
 )
+:: Run uninstall hook if defined
+set "ADDON_UNINSTALL_EP="
+call :ParseYmlQuiet "%INSTALL_DIR%\%TARGET%"
+if defined ADDON_UNINSTALL_EP (
+    echo [configurer] Running uninstall hook for '%TARGET%'...
+    pushd "%INSTALL_DIR%\%TARGET%"
+    cmd /c !ADDON_UNINSTALL_EP!
+    if !ERRORLEVEL! NEQ 0 (
+        echo [configurer] WARNING: Uninstall hook for '%TARGET%' exited with error.
+    )
+    popd
+    echo.
+)
 rmdir /s /q "%INSTALL_DIR%\%TARGET%" 2>nul
 if exist "%INSTALL_DIR%\%TARGET%\." (
     echo [configurer] ERROR: Failed to remove '%TARGET%'.
@@ -242,29 +264,53 @@ if not defined ADDON_NAME (
 echo [configurer]   Name:       !ADDON_NAME!
 echo [configurer]   Version:    !ADDON_VERSION!
 echo [configurer]   Entrypoint: !ADDON_ENTRYPOINT!
+if defined ADDON_INSTALL_EP echo [configurer]   Install:    !ADDON_INSTALL_EP!
+if defined ADDON_UPDATE_EP echo [configurer]   Update:     !ADDON_UPDATE_EP!
+if defined ADDON_UNINSTALL_EP echo [configurer]   Uninstall:  !ADDON_UNINSTALL_EP!
 if defined ADDON_SOURCE echo [configurer]   Source:     !ADDON_SOURCE!
 if defined ADDON_DEPS echo [configurer]   Deps:       !ADDON_DEPS!
 echo.
+
+:: Save install hook before deps clobber ADDON_ vars
+set "SAVE_INSTALL_EP=!ADDON_INSTALL_EP!"
+set "SAVE_INSTALL_NAME=!ADDON_NAME!"
+set "SAVE_INSTALL_VER=!ADDON_VERSION!"
 
 call :InstallAddon "!RESOLVED_PATH!" "!ADDON_NAME!"
 call :CleanupResolve
 if !EXITCODE! NEQ 0 goto :Cleanup
 
-echo [configurer] Successfully installed '!ADDON_NAME!' v!ADDON_VERSION!
+echo [configurer] Successfully installed '!SAVE_INSTALL_NAME!' v!SAVE_INSTALL_VER!
 echo.
 
 :: Create command shim and ensure PATH
-call :CreateShim "!ADDON_NAME!"
+call :CreateShim "!SAVE_INSTALL_NAME!"
 call :EnsureCommandsInPath
 
-if not defined ADDON_DEPS goto :CmdInstall_Done
+if not defined ADDON_DEPS goto :CmdInstall_RunHook
 echo [configurer] Resolving dependencies...
-set "VISITED_DEPS=!ADDON_NAME!"
-call :ResolveDeps "%INSTALL_DIR%\!ADDON_NAME!"
+set "VISITED_DEPS=!SAVE_INSTALL_NAME!"
+call :ResolveDeps "%INSTALL_DIR%\!SAVE_INSTALL_NAME!"
 if !EXITCODE! NEQ 0 (
     echo [configurer] WARNING: Some dependencies could not be resolved.
 ) else (
     echo [configurer] All dependencies satisfied.
+)
+
+:CmdInstall_RunHook
+:: Run install hook after deps are resolved (deps run their hooks first)
+if defined SAVE_INSTALL_EP (
+    echo.
+    echo [configurer] Running install hook for '!SAVE_INSTALL_NAME!'...
+    pushd "%INSTALL_DIR%\!SAVE_INSTALL_NAME!"
+    cmd /c !SAVE_INSTALL_EP!
+    set "EXITCODE=!ERRORLEVEL!"
+    popd
+    if !EXITCODE! NEQ 0 (
+        echo [configurer] ERROR: Install hook for '!SAVE_INSTALL_NAME!' failed with code !EXITCODE!.
+        goto :Cleanup
+    )
+    echo [configurer] Install hook for '!SAVE_INSTALL_NAME!' completed.
 )
 :CmdInstall_Done
 goto :Cleanup
@@ -342,6 +388,16 @@ if !EXITCODE! NEQ 0 (
 goto :Cleanup
 
 :: ===========================================================================
+:: SELF-UPDATE subcommand (bypass 8h cooldown)
+:: ===========================================================================
+:CmdSelfUpdate
+set "FORCE_UPDATE_CHECK=1"
+call :SelfUpdate
+if "!UPDATE_IN_PROGRESS!"=="1" exit /b 0
+echo [configurer] Already up to date.
+exit /b 0
+
+:: ===========================================================================
 :: UPDATE subcommand
 :: ===========================================================================
 :CmdUpdate
@@ -383,6 +439,7 @@ echo Usage:
 echo   configurer install ^<target^>
 echo   configurer run ^<target^> [args...]
 echo   configurer update [name]
+echo   configurer self-update
 echo   configurer ls
 echo   configurer uninstall ^<name^>
 echo.
@@ -390,6 +447,7 @@ echo Subcommands:
 echo   install     Install an addon and its dependencies.
 echo   run         Run an addon. Args after target are passed to entrypoint.
 echo   update      Update one or all installed addons.
+echo   self-update Force a self-update check (bypasses 8h cooldown).
 echo   ls          List installed addons.
 echo   uninstall   Remove an installed addon.
 echo.
@@ -404,6 +462,9 @@ echo   apiVersion: 1
 echo   name: my-addon
 echo   version: 1.0.0
 echo   entrypoint: powershell -File main.ps1
+echo   install: install.cmd
+echo   update: install.cmd
+echo   uninstall: uninstall.cmd
 echo   source: https://github.com/org/addons/tree/main/my-addon
 echo   dependencies:
 echo     - core-utils
@@ -670,9 +731,22 @@ call :CleanupResolve
 if !EXITCODE! NEQ 0 goto :eof
 
 :: Check dep constraints after update
-if not defined ADDON_DEPS goto :UpdateAddon_Done
+if not defined ADDON_DEPS goto :UpdateAddon_Hook
 set "VISITED_DEPS=!UA_NAME!"
 call :ResolveDeps "%INSTALL_DIR%\!UA_NAME!"
+:UpdateAddon_Hook
+:: Run update hook after deps are satisfied
+set "ADDON_UPDATE_EP="
+call :ParseYmlQuiet "%INSTALL_DIR%\!UA_NAME!"
+if defined ADDON_UPDATE_EP (
+    echo [configurer]   Running update hook for '!UA_NAME!'...
+    pushd "%INSTALL_DIR%\!UA_NAME!"
+    cmd /c !ADDON_UPDATE_EP!
+    if !ERRORLEVEL! NEQ 0 (
+        echo [configurer]   WARNING: Update hook for '!UA_NAME!' failed.
+    )
+    popd
+)
 :UpdateAddon_Done
 call :CreateShim "!UA_NAME!"
 echo [configurer]   '!UA_NAME!' updated to v!UA_REMOTE_VER!
@@ -707,6 +781,8 @@ goto :eof
 set "DEP_SPEC=%~1"
 set "DEP_NAME="
 set "DEP_MINVER="
+set "DEP_IS_UPDATE=0"
+set "DEP_DID_CHANGE=0"
 
 :: Split name@version
 for /f "tokens=1,2 delims=@" %%A in ("!DEP_SPEC!") do (
@@ -747,11 +823,13 @@ if "!VER_RESULT!"=="yes" (
 echo [configurer]   Dependency '!DEP_NAME!' v!DEP_INST_VER! below required v!DEP_MINVER!. Updating...
 set "DEP_FETCH=!ADDON_SOURCE!"
 if not defined DEP_FETCH set "DEP_FETCH=!DEP_NAME!"
+set "DEP_IS_UPDATE=1"
 goto :ProcessOneDep_DoInstall
 
 :ProcessOneDep_Install
 echo [configurer]   Installing dependency '!DEP_NAME!'...
 set "DEP_FETCH=!DEP_NAME!"
+set "DEP_IS_UPDATE=0"
 
 :ProcessOneDep_DoInstall
 set "RESOLVED_PATH="
@@ -766,15 +844,54 @@ call :InstallAddon "!RESOLVED_PATH!" "!DEP_NAME!"
 call :CleanupResolve
 if !EXITCODE! NEQ 0 goto :eof
 echo [configurer]   Dependency '!DEP_NAME!' installed.
+set "DEP_DID_CHANGE=1"
 
 :ProcessOneDep_Recurse
-:: Recurse into this dep's own dependencies
+:: Recurse into this dep's own dependencies first (depth-first)
 call :ResolveDeps "%INSTALL_DIR%\!DEP_NAME!"
+if !EXITCODE! NEQ 0 goto :eof
+:: Run lifecycle hook only if files were actually installed/updated
+if "!DEP_DID_CHANGE!"=="1" call :RunDepHook "!DEP_NAME!" "!DEP_IS_UPDATE!"
+goto :eof
+
+:: ---------------------------------------------------------------------------
+:: :RunDepHook - Run install or update hook for a dependency
+:: %~1 = dep name, %~2 = is_update (0=install, 1=update)
+:: ---------------------------------------------------------------------------
+:RunDepHook
+set "RDH_NAME=%~1"
+set "RDH_UPDATE=%~2"
+set "RDH_DIR=%INSTALL_DIR%\!RDH_NAME!"
+set "ADDON_INSTALL_EP="
+set "ADDON_UPDATE_EP="
+call :ParseYmlQuiet "!RDH_DIR!"
+if "!RDH_UPDATE!"=="1" (
+    if defined ADDON_UPDATE_EP (
+        echo [configurer]   Running update hook for dep '!RDH_NAME!'...
+        pushd "!RDH_DIR!"
+        cmd /c !ADDON_UPDATE_EP!
+        if !ERRORLEVEL! NEQ 0 (
+            echo [configurer]   WARNING: Update hook for dep '!RDH_NAME!' failed.
+        )
+        popd
+    )
+) else (
+    if defined ADDON_INSTALL_EP (
+        echo [configurer]   Running install hook for dep '!RDH_NAME!'...
+        pushd "!RDH_DIR!"
+        cmd /c !ADDON_INSTALL_EP!
+        if !ERRORLEVEL! NEQ 0 (
+            echo [configurer]   WARNING: Install hook for dep '!RDH_NAME!' failed.
+        )
+        popd
+    )
+)
 goto :eof
 
 :: ---------------------------------------------------------------------------
 :: :ParseYml - Full parse with validation (errors printed)
-:: Sets ADDON_NAME, ADDON_VERSION, ADDON_ENTRYPOINT, ADDON_SOURCE, ADDON_DEPS
+:: Sets ADDON_NAME, ADDON_VERSION, ADDON_ENTRYPOINT, ADDON_SOURCE, ADDON_DEPS,
+::      ADDON_INSTALL_EP, ADDON_UPDATE_EP, ADDON_UNINSTALL_EP
 :: %~1 = directory
 :: ---------------------------------------------------------------------------
 :ParseYml
@@ -790,6 +907,9 @@ set "ADDON_VERSION="
 set "ADDON_ENTRYPOINT="
 set "ADDON_SOURCE="
 set "ADDON_DEPS="
+set "ADDON_INSTALL_EP="
+set "ADDON_UPDATE_EP="
+set "ADDON_UNINSTALL_EP="
 for /f "usebackq tokens=1,* delims==" %%A in ("!YML_OUT!") do (
     if /i "%%A"=="ERROR" (
         echo [configurer] ERROR: %%B
@@ -800,6 +920,9 @@ for /f "usebackq tokens=1,* delims==" %%A in ("!YML_OUT!") do (
     if /i "%%A"=="ENTRYPOINT" set "ADDON_ENTRYPOINT=%%B"
     if /i "%%A"=="SOURCE" set "ADDON_SOURCE=%%B"
     if /i "%%A"=="DEPS" set "ADDON_DEPS=%%B"
+    if /i "%%A"=="INSTALL_EP" set "ADDON_INSTALL_EP=%%B"
+    if /i "%%A"=="UPDATE_EP" set "ADDON_UPDATE_EP=%%B"
+    if /i "%%A"=="UNINSTALL_EP" set "ADDON_UNINSTALL_EP=%%B"
 )
 
 del "!PS_TEMP!" 2>nul
@@ -823,12 +946,18 @@ set "ADDON_VERSION="
 set "ADDON_ENTRYPOINT="
 set "ADDON_SOURCE="
 set "ADDON_DEPS="
+set "ADDON_INSTALL_EP="
+set "ADDON_UPDATE_EP="
+set "ADDON_UNINSTALL_EP="
 for /f "usebackq tokens=1,* delims==" %%A in ("!YML_OUT!") do (
     if /i "%%A"=="NAME" set "ADDON_NAME=%%B"
     if /i "%%A"=="VERSION" set "ADDON_VERSION=%%B"
     if /i "%%A"=="ENTRYPOINT" set "ADDON_ENTRYPOINT=%%B"
     if /i "%%A"=="SOURCE" set "ADDON_SOURCE=%%B"
     if /i "%%A"=="DEPS" set "ADDON_DEPS=%%B"
+    if /i "%%A"=="INSTALL_EP" set "ADDON_INSTALL_EP=%%B"
+    if /i "%%A"=="UPDATE_EP" set "ADDON_UPDATE_EP=%%B"
+    if /i "%%A"=="UNINSTALL_EP" set "ADDON_UNINSTALL_EP=%%B"
 )
 
 del "!PS_TEMP!" 2>nul
@@ -852,7 +981,7 @@ if /i "!WYP_MODE!"=="quiet" goto :WYP_Skip1
 >> "!WYP_FILE!" echo     exit 1
 >> "!WYP_FILE!" echo }
 >> "!WYP_FILE!" echo $content = Get-Content $ymlPath -Raw
->> "!WYP_FILE!" echo $apiVersion = ''; $name = ''; $version = ''; $entrypoint = ''; $source = ''
+>> "!WYP_FILE!" echo $apiVersion = ''; $name = ''; $version = ''; $entrypoint = ''; $source = ''; $installEp = ''; $updateEp = ''; $uninstallEp = ''
 >> "!WYP_FILE!" echo $deps = @()
 >> "!WYP_FILE!" echo $inDeps = $false
 >> "!WYP_FILE!" echo foreach ($line in ($content -split "`n")) {
@@ -862,6 +991,9 @@ if /i "!WYP_MODE!"=="quiet" goto :WYP_Skip1
 >> "!WYP_FILE!" echo     elseif ($trimmed -match '^version:\s*(.+)$') { $version = $Matches[1].Trim(); $inDeps = $false }
 >> "!WYP_FILE!" echo     elseif ($trimmed -match '^entrypoint:\s*(.+)$') { $entrypoint = $Matches[1].Trim(); $inDeps = $false }
 >> "!WYP_FILE!" echo     elseif ($trimmed -match '^source:\s*(.+)$') { $source = $Matches[1].Trim(); $inDeps = $false }
+>> "!WYP_FILE!" echo     elseif ($trimmed -match '^install:\s*(.+)$') { $installEp = $Matches[1].Trim(); $inDeps = $false }
+>> "!WYP_FILE!" echo     elseif ($trimmed -match '^update:\s*(.+)$') { $updateEp = $Matches[1].Trim(); $inDeps = $false }
+>> "!WYP_FILE!" echo     elseif ($trimmed -match '^uninstall:\s*(.+)$') { $uninstallEp = $Matches[1].Trim(); $inDeps = $false }
 >> "!WYP_FILE!" echo     elseif ($trimmed -match '^dependencies:\s*$') { $inDeps = $true }
 >> "!WYP_FILE!" echo     elseif ($inDeps -and $trimmed -match '^\-\s*(.+)$') { $deps += $Matches[1].Trim() }
 >> "!WYP_FILE!" echo     elseif ($trimmed -ne '' -and $trimmed -notmatch '^\#') { $inDeps = $false }
@@ -878,6 +1010,9 @@ if /i "!WYP_MODE!"=="quiet" goto :WYP_Skip2
 >> "!WYP_FILE!" echo if ($entrypoint) { Write-Output "ENTRYPOINT=$entrypoint" }
 >> "!WYP_FILE!" echo if ($source) { Write-Output "SOURCE=$source" }
 >> "!WYP_FILE!" echo if ($deps.Count -gt 0) { Write-Output "DEPS=$($deps -join ' ')" }
+>> "!WYP_FILE!" echo if ($installEp) { Write-Output "INSTALL_EP=$installEp" }
+>> "!WYP_FILE!" echo if ($updateEp) { Write-Output "UPDATE_EP=$updateEp" }
+>> "!WYP_FILE!" echo if ($uninstallEp) { Write-Output "UNINSTALL_EP=$uninstallEp" }
 goto :eof
 
 :: ---------------------------------------------------------------------------
@@ -950,6 +1085,19 @@ set "HELPER=%TEMP%\configurer_upd_%RANDOM%.bat"
 set "LOCAL_VER="
 set "REMOTE_VER="
 
+:: Skip if last check was less than 8 hours (28800 seconds) ago
+if not "%FORCE_UPDATE_CHECK%"=="1" (
+    if exist "%TIMESTAMP_FILE%" (
+        for /f %%t in ('type "%TIMESTAMP_FILE%"') do set "LAST_CHECK=%%t"
+        for /f %%t in ('powershell -NoProfile -ExecutionPolicy Bypass -Command "[int][double]::Parse((Get-Date -UFormat '%%s'))"') do set "NOW_TS=%%t"
+        set /a "ELAPSED=!NOW_TS!-!LAST_CHECK!"
+        if !ELAPSED! LSS 28800 (
+            goto :eof
+        )
+    )
+)
+set "FORCE_UPDATE_CHECK=0"
+
 echo [configurer] Checking for updates...
 curl -fsSL "%SCRIPT_URL%" -o "%TMPSCRIPT%" 2>nul
 if %ERRORLEVEL% NEQ 0 (
@@ -967,6 +1115,10 @@ if not defined REMOTE_VER (
     goto :eof
 )
 if not defined LOCAL_VER set "LOCAL_VER=0"
+
+:: Record successful update check timestamp
+if not exist "%USERPROFILE%\.config\configurer\." mkdir "%USERPROFILE%\.config\configurer" 2>nul
+for /f %%t in ('powershell -NoProfile -ExecutionPolicy Bypass -Command "[int][double]::Parse((Get-Date -UFormat '%%s'))"') do echo %%t> "%TIMESTAMP_FILE%"
 
 if %REMOTE_VER% LEQ %LOCAL_VER% (
     del "%TMPSCRIPT%" 2>nul

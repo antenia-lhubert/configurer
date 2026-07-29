@@ -3,7 +3,8 @@
 Module-based machine provisioning via git.
 
 Manages addons defined by `.configurer.yml` manifests. Addons declare a name,
-version, entrypoint command, optional source URL, and dependencies.
+version, entrypoint command, optional lifecycle hooks (install, update,
+uninstall), optional source URL, and dependencies.
 
 ## Install
 
@@ -22,6 +23,7 @@ After running, open a new terminal and use `configurer` from any directory.
 configurer install <target>
 configurer run <target> [args...]
 configurer update [name]
+configurer self-update
 configurer ls
 configurer uninstall <name>
 ```
@@ -30,11 +32,12 @@ configurer uninstall <name>
 
 | Command | Description |
 |---------|-------------|
-| `install <target>` | Install an addon and its dependencies |
+| `install <target>` | Install an addon and its dependencies, then run install hook |
 | `run <target> [args...]` | Run an addon's entrypoint, passing remaining args through |
-| `update [name]` | Update one or all installed addons (skips if already current) |
+| `update [name]` | Update one or all installed addons (skips if already current), then run update hook |
+| `self-update` | Force a self-update check (bypasses the 8-hour cooldown) |
 | `ls` | List installed addons with versions |
-| `uninstall <name>` | Remove an installed addon |
+| `uninstall <name>` | Run uninstall hook, then remove an installed addon |
 
 ### Target Resolution
 
@@ -52,6 +55,19 @@ Targets are resolved in this order:
 |------|-------------|
 | `--no-update` | Skip the self-update check (can appear anywhere in args) |
 
+### Update Check Cooldown
+
+To avoid unnecessary network calls, the automatic self-update check is throttled to
+run at most once every 8 hours. After a successful check, a timestamp is saved to:
+
+```
+%USERPROFILE%\.config\configurer\last_update_check.timestamp
+```
+
+On subsequent invocations, if the timestamp is less than 8 hours old the check is
+skipped entirely. Use `configurer self-update` to bypass this cooldown and force an
+immediate check.
+
 ## .configurer.yml
 
 Every addon must have a `.configurer.yml` at its root:
@@ -61,6 +77,9 @@ apiVersion: 1
 name: my-addon
 version: 1.0.0
 entrypoint: powershell -NoProfile -ExecutionPolicy Bypass -File main.ps1
+install: install.cmd
+update: install.cmd
+uninstall: uninstall.cmd
 source: https://github.com/org/addons/tree/main/my-addon
 dependencies:
   - core-utils
@@ -72,7 +91,10 @@ dependencies:
 | `apiVersion` | Yes | Must be `1` |
 | `name` | Yes | Addon identity (used as folder name in the addon store) |
 | `version` | Yes | Semantic version (used for dependency constraints and updates) |
-| `entrypoint` | Yes | Command string executed via `cmd /c` with CWD set to addon root |
+| `entrypoint` | Yes | Command string executed via `cmd /c` with CWD set to addon root (used by `configurer run`) |
+| `install` | No | Command executed after `configurer install` copies files and deps are satisfied |
+| `update` | No | Command executed after `configurer update` updates files and deps are re-checked |
+| `uninstall` | No | Command executed before `configurer uninstall` deletes files |
 | `source` | No | Where to fetch updates from (same resolution logic as targets) |
 | `dependencies` | No | List of `name` or `name@min_version` entries |
 
@@ -80,9 +102,37 @@ dependencies:
 
 - Dependencies are resolved transitively (deps of deps)
 - Cycle-safe via visited-set tracking (silently skips already-processed addons)
-- On `install`: missing deps are auto-installed after the addon itself
+- On `install`: missing deps are auto-installed before the parent addon's install hook runs
 - On `run`: missing deps are auto-installed before execution
+- On `update`: deps are re-checked and updated before the parent addon's update hook runs
 - Version constraints use semver comparison (`>=`); if an installed dep is below the required minimum, it is re-fetched from its `source` field (or the official repo)
+
+## Lifecycle Hooks
+
+Lifecycle hooks are optional commands that run at specific points during addon management:
+
+| Hook | When it runs |
+|------|-------------|
+| `install` | After files are copied and all dependencies are satisfied |
+| `update` | After files are updated and all dependencies are re-checked |
+| `uninstall` | Before files are deleted |
+
+### Execution Order
+
+For `configurer install`:
+1. Addon files are copied to the addon store
+2. Dependencies are resolved recursively (depth-first)
+3. Each newly-installed dep's `install` hook runs (after its own sub-deps are done)
+4. The target addon's `install` hook runs last
+
+For `configurer update`:
+1. Addon files are updated in the addon store
+2. Dependencies are re-checked (updated if needed, with their `update` hooks)
+3. The target addon's `update` hook runs last
+
+For `configurer uninstall`:
+1. The addon's `uninstall` hook runs
+2. Addon files are deleted (no cascading to dependencies)
 
 ## Addon Store
 
@@ -133,6 +183,9 @@ configurer update
 :: Update a specific addon
 configurer update my-addon
 
+:: Force a self-update check (ignores 8h cooldown)
+configurer self-update
+
 :: List installed addons
 configurer ls
 
@@ -145,11 +198,12 @@ my-addon --verbose --target=prod
 
 ## How It Works
 
-1. **Self-update** - checks GitHub for a newer version of configurer.bat and restarts if found
+1. **Self-update** - checks GitHub for a newer version of configurer.bat and restarts if found (throttled to once every 8 hours; use `self-update` to bypass)
 2. **Ensure git** - installs `git` via `winget` if not already in PATH
 3. **Resolve target** - GitHub subpath, git URL, local path, installed name, or official repo
 4. **Validate manifest** - parses `.configurer.yml`, checks `apiVersion`, required fields
 5. **Install/Run** - copies to addon store (install) or executes entrypoint (run)
-6. **Create command shim** - writes a `.bat` shim so the addon is callable by name
-7. **Ensure PATH** - adds the commands directory to the user's PATH if not already present
-8. **Resolve dependencies** - recursively installs/updates any missing or outdated deps
+6. **Resolve dependencies** - recursively installs/updates any missing or outdated deps, running their lifecycle hooks depth-first
+7. **Run lifecycle hook** - executes the addon's `install`/`update`/`uninstall` hook as appropriate
+8. **Create command shim** - writes a `.bat` shim so the addon is callable by name
+9. **Ensure PATH** - adds the commands directory to the user's PATH if not already present

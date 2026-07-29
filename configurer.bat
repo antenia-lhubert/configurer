@@ -1,4 +1,4 @@
-:: Version: 3
+:: Version: 4
 @echo off
 setlocal EnableDelayedExpansion
 
@@ -1081,7 +1081,6 @@ goto :eof
 :: ---------------------------------------------------------------------------
 :SelfUpdate
 set "TMPSCRIPT=%TEMP%\configurer_new_%RANDOM%.bat"
-set "HELPER=%TEMP%\configurer_upd_%RANDOM%.bat"
 set "LOCAL_VER="
 set "REMOTE_VER="
 
@@ -1106,8 +1105,8 @@ if %ERRORLEVEL% NEQ 0 (
     goto :eof
 )
 
-for /f "tokens=3" %%v in ('findstr "Version:" "%TMPSCRIPT%" 2^>nul') do set "REMOTE_VER=%%v"
-for /f "tokens=3" %%v in ('findstr "Version:" "%~f0"   2^>nul') do set "LOCAL_VER=%%v"
+for /f "tokens=3" %%v in ('findstr /b /c:":: Version:" "%TMPSCRIPT%" 2^>nul') do set "REMOTE_VER=%%v"
+for /f "tokens=3" %%v in ('findstr /b /c:":: Version:" "%~f0"   2^>nul') do set "LOCAL_VER=%%v"
 
 if not defined REMOTE_VER (
     echo [configurer] WARNING: Could not read remote version. Continuing.
@@ -1129,17 +1128,17 @@ echo [configurer] New version available ^(%LOCAL_VER% -^> %REMOTE_VER%^). Updati
 
 set "RESTART_ARGS=!SUBCMD! !TARGET! !PASSTHROUGH_ARGS!"
 
+:: Compound block is parsed into memory before execution, so overwriting
+:: the running script mid-block is safe.
 (
-    echo @echo off
-    echo ping -n 3 127.0.0.1 ^>nul
-    echo copy /y "%TMPSCRIPT%" "%~f0" ^>nul
-    echo del "%TMPSCRIPT%" 2^>nul
-    echo start "" "%~f0" --no-update !RESTART_ARGS!
-    echo del "%%~f0"
-) > "%HELPER%"
-
-start "" /b cmd /c "%HELPER%"
-set "UPDATE_IN_PROGRESS=1"
+    copy /y "%TMPSCRIPT%" "%~f0" >nul 2>nul
+    del "%TMPSCRIPT%" 2>nul
+    echo [configurer] Updated to version %REMOTE_VER%.
+    if defined SUBCMD (
+        cmd /c ""%~f0" --no-update !RESTART_ARGS!"
+    )
+    set "UPDATE_IN_PROGRESS=1"
+)
 goto :eof
 
 :: ---------------------------------------------------------------------------

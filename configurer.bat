@@ -1,4 +1,4 @@
-:: Version: 4
+:: Version: 5
 @echo off
 setlocal EnableDelayedExpansion
 
@@ -23,7 +23,8 @@ setlocal EnableDelayedExpansion
 ::               dependencies are satisfied.
 ::
 ::   run         Execute an addon's entrypoint. Same resolution as install.
-::               Missing dependencies are auto-installed before execution.
+::               Missing dependencies are resolved before execution. For an
+::               install-less run they are fetched to a temporary store.
 ::               All arguments after the target are passed to the entrypoint.
 ::
 ::   update      Re-fetch and reinstall an addon if a newer version is available.
@@ -72,8 +73,12 @@ set "COMMANDS_DIR=%USERPROFILE%\.config\configurer\commands"
 set "TIMESTAMP_FILE=%USERPROFILE%\.config\configurer\last_update_check.timestamp"
 set "EXITCODE=0"
 set "TMPDIR="
+set "RUN_TMPDIR="
 set "UPDATE_IN_PROGRESS=0"
 set "VISITED_DEPS="
+set "DEPS_DIR=%INSTALL_DIR%"
+set "DEPS_COMMANDS_DIR=%COMMANDS_DIR%"
+set "DEPS_EPHEMERAL=0"
 
 :: ---------------------------------------------------------------------------
 :: Parse arguments using shift (preserves = signs in args)
@@ -333,6 +338,7 @@ call :Resolve "%TARGET%" "run"
 if !EXITCODE! NEQ 0 goto :Cleanup
 
 set "RUN_PATH=!RESOLVED_PATH!"
+set "RUN_IS_INSTALLED=!RESOLVE_INSTALLED!"
 if defined RESOLVE_TMPDIR set "TMPDIR=!RESOLVE_TMPDIR!"
 
 echo [configurer] Reading .configurer.yml...
@@ -351,6 +357,20 @@ if not defined ADDON_ENTRYPOINT (
 )
 
 if not defined ADDON_DEPS goto :CmdRun_Exec
+set "DEPS_DIR=%INSTALL_DIR%"
+set "DEPS_COMMANDS_DIR=%COMMANDS_DIR%"
+set "DEPS_EPHEMERAL=0"
+if "!RUN_IS_INSTALLED!"=="1" set "PATH=!DEPS_COMMANDS_DIR!;!PATH!"
+if "!RUN_IS_INSTALLED!"=="1" goto :CmdRun_CheckDeps
+if not defined CONFIGURER_RUNTIME_DIR (
+    set "RUN_TMPDIR=%TEMP%\configurer_run_%RANDOM%_%RANDOM%"
+    set "CONFIGURER_RUNTIME_DIR=!RUN_TMPDIR!"
+)
+set "DEPS_DIR=!CONFIGURER_RUNTIME_DIR!\installed"
+set "DEPS_COMMANDS_DIR=!CONFIGURER_RUNTIME_DIR!\commands"
+set "DEPS_EPHEMERAL=1"
+set "PATH=!DEPS_COMMANDS_DIR!;!PATH!"
+:CmdRun_CheckDeps
 echo [configurer] Checking dependencies...
 set "VISITED_DEPS=!ADDON_NAME!"
 set "SAVE_RUN_NAME=!ADDON_NAME!"
@@ -483,6 +503,9 @@ if defined TMPDIR (
         rmdir /s /q "!TMPDIR!" 2>nul
     )
 )
+if defined RUN_TMPDIR (
+    if exist "!RUN_TMPDIR!\." rmdir /s /q "!RUN_TMPDIR!" 2>nul
+)
 exit /b %EXITCODE%
 
 :: ============================================================================
@@ -502,6 +525,7 @@ set "RESOLVE_TMPDIR="
 set "RESOLVE_REPO_URL="
 set "RESOLVE_BRANCH="
 set "RESOLVE_SUBPATH="
+set "RESOLVE_INSTALLED=0"
 
 :: Step 1: Check GitHub URL with subpath
 echo "!RESOLVE_INPUT!" | findstr /i "github.com" >nul 2>&1
@@ -572,6 +596,7 @@ goto :Resolve_Official
 if not exist "%INSTALL_DIR%\!RESOLVE_INPUT!\." goto :Resolve_Official
 echo [configurer]   Using installed addon: !RESOLVE_INPUT!
 set "RESOLVED_PATH=%INSTALL_DIR%\!RESOLVE_INPUT!"
+set "RESOLVE_INSTALLED=1"
 goto :eof
 
 :Resolve_Official
@@ -647,16 +672,18 @@ if defined RESOLVE_TMPDIR (
 goto :eof
 
 :: ---------------------------------------------------------------------------
-:: :InstallAddon - Copy addon to install directory
-:: %~1 = source path, %~2 = addon name
+:: :InstallAddon - Copy addon to a persistent or temporary store
+:: %~1 = source path, %~2 = addon name, %~3 = optional destination root
 :: ---------------------------------------------------------------------------
 :InstallAddon
 set "IA_SRC=%~1"
 set "IA_NAME=%~2"
-set "IA_DEST=%INSTALL_DIR%\!IA_NAME!"
+set "IA_ROOT=%~3"
+if not defined IA_ROOT set "IA_ROOT=%INSTALL_DIR%"
+set "IA_DEST=!IA_ROOT!\!IA_NAME!"
 
 if exist "!IA_DEST!\." rmdir /s /q "!IA_DEST!" 2>nul
-if not exist "%INSTALL_DIR%\." mkdir "%INSTALL_DIR%"
+if not exist "!IA_ROOT!\." mkdir "!IA_ROOT!"
 xcopy "!IA_SRC!\*" "!IA_DEST!\" /E /I /Q /Y >nul
 if !ERRORLEVEL! NEQ 0 (
     echo [configurer] ERROR: Failed to copy addon files for '!IA_NAME!'.
@@ -754,7 +781,7 @@ set "EXITCODE=0"
 goto :eof
 
 :: ---------------------------------------------------------------------------
-:: :ResolveDeps - Recursively resolve and install dependencies
+:: :ResolveDeps - Recursively resolve dependencies
 :: %~1 = addon directory
 :: ---------------------------------------------------------------------------
 :ResolveDeps
@@ -797,8 +824,8 @@ set "VISITED_DEPS=!VISITED_DEPS! !DEP_NAME!"
 set "DEP_IS_UPDATE=0"
 set "DEP_DID_CHANGE=0"
 
-:: Check if installed
-if not exist "%INSTALL_DIR%\!DEP_NAME!\." goto :ProcessOneDep_Install
+:: Check if available in this dependency context
+if not exist "!DEPS_DIR!\!DEP_NAME!\." goto :ProcessOneDep_Install
 
 :: Already installed - check version constraint
 if not defined DEP_MINVER (
@@ -810,7 +837,7 @@ if not defined DEP_MINVER (
 set "ADDON_NAME="
 set "ADDON_VERSION="
 set "ADDON_SOURCE="
-call :ParseYmlQuiet "%INSTALL_DIR%\!DEP_NAME!"
+call :ParseYmlQuiet "!DEPS_DIR!\!DEP_NAME!"
 set "DEP_INST_VER=!ADDON_VERSION!"
 
 :: Compare versions
@@ -829,7 +856,11 @@ set "DEP_IS_UPDATE=1"
 goto :ProcessOneDep_DoInstall
 
 :ProcessOneDep_Install
-echo [configurer]   Installing dependency '!DEP_NAME!'...
+if "!DEPS_EPHEMERAL!"=="1" (
+    echo [configurer]   Fetching temporary dependency '!DEP_NAME!'...
+) else (
+    echo [configurer]   Installing dependency '!DEP_NAME!'...
+)
 set "DEP_FETCH=!DEP_NAME!"
 set "DEP_IS_UPDATE=0"
 
@@ -842,10 +873,19 @@ if !EXITCODE! NEQ 0 (
     call :CleanupResolve
     goto :eof
 )
-call :InstallAddon "!RESOLVED_PATH!" "!DEP_NAME!"
+call :InstallAddon "!RESOLVED_PATH!" "!DEP_NAME!" "!DEPS_DIR!"
 call :CleanupResolve
 if !EXITCODE! NEQ 0 goto :eof
-echo [configurer]   Dependency '!DEP_NAME!' installed.
+if "!DEPS_EPHEMERAL!"=="1" (
+    call :CreateShim "!DEP_NAME!" "!DEPS_COMMANDS_DIR!" "!DEPS_DIR!\!DEP_NAME!"
+) else (
+    call :CreateShim "!DEP_NAME!"
+)
+if "!DEPS_EPHEMERAL!"=="1" (
+    echo [configurer]   Dependency '!DEP_NAME!' ready for this run.
+) else (
+    echo [configurer]   Dependency '!DEP_NAME!' installed.
+)
 set "DEP_DID_CHANGE=1"
 
 :ProcessOneDep_Recurse
@@ -858,7 +898,7 @@ for %%i in (!PD_DEPTH!) do (
     set "PD_UPD_%%i=!DEP_IS_UPDATE!"
 )
 :: Recurse into this dep's own dependencies first (depth-first)
-call :ResolveDeps "%INSTALL_DIR%\!DEP_NAME!"
+call :ResolveDeps "!DEPS_DIR!\!DEP_NAME!"
 :: Restore state after recursion
 for %%i in (!PD_DEPTH!) do (
     set "DEP_NAME=!PD_NAME_%%i!"
@@ -868,7 +908,7 @@ for %%i in (!PD_DEPTH!) do (
 set /a "PD_DEPTH-=1"
 if !EXITCODE! NEQ 0 goto :eof
 :: Run lifecycle hook only if files were actually installed/updated
-if "!DEP_DID_CHANGE!"=="1" call :RunDepHook "!DEP_NAME!" "!DEP_IS_UPDATE!"
+if "!DEP_DID_CHANGE!"=="1" if "!DEPS_EPHEMERAL!"=="0" call :RunDepHook "!DEP_NAME!" "!DEP_IS_UPDATE!"
 goto :eof
 
 :: ---------------------------------------------------------------------------
@@ -1034,14 +1074,21 @@ goto :eof
 
 :: ---------------------------------------------------------------------------
 :: :CreateShim - Create a command shim .bat for an addon
-:: %~1 = addon name
+:: %~1 = addon name, %~2 = optional shim directory, %~3 = optional addon path
 :: ---------------------------------------------------------------------------
 :CreateShim
 set "SHIM_NAME=%~1"
+set "SHIM_DIR=%~2"
+set "SHIM_TARGET=%~3"
 if not defined SHIM_NAME goto :eof
-if not exist "!COMMANDS_DIR!\." mkdir "!COMMANDS_DIR!"
-> "!COMMANDS_DIR!\!SHIM_NAME!.bat" echo @echo off
->> "!COMMANDS_DIR!\!SHIM_NAME!.bat" echo configurer run !SHIM_NAME! %%*
+if not defined SHIM_DIR set "SHIM_DIR=%COMMANDS_DIR%"
+if not exist "!SHIM_DIR!\." mkdir "!SHIM_DIR!"
+> "!SHIM_DIR!\!SHIM_NAME!.bat" echo @echo off
+if defined SHIM_TARGET (
+    >> "!SHIM_DIR!\!SHIM_NAME!.bat" echo call "%~f0" --no-update run "!SHIM_TARGET!" %%*
+) else (
+    >> "!SHIM_DIR!\!SHIM_NAME!.bat" echo configurer run !SHIM_NAME! %%*
+)
 goto :eof
 
 :: ---------------------------------------------------------------------------

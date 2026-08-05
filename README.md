@@ -103,9 +103,12 @@ dependencies:
 - Dependencies are resolved transitively (deps of deps)
 - Cycle-safe via visited-set tracking (silently skips already-processed addons)
 - On `install`: missing deps are auto-installed before the parent addon's install hook runs
-- On `run`: missing deps are auto-installed before execution
+- On an install-less `run`: dependencies are fetched into a temporary store, exposed through temporary command shims, and removed after execution
+- On `run` for an installed addon: missing dependencies are installed persistently before execution
 - On `update`: deps are re-checked and updated before the parent addon's update hook runs
 - Version constraints use semver comparison (`>=`); if an installed dep is below the required minimum, it is re-fetched from its `source` field (or the official repo)
+- Newly installed or updated persistent dependencies receive command shims just like directly installed addons
+- Temporary dependencies do not run install/update hooks or modify the user's addon store, command directory, or persistent `PATH` setting
 
 ## Lifecycle Hooks
 
@@ -122,7 +125,7 @@ Lifecycle hooks are optional commands that run at specific points during addon m
 For `configurer install`:
 1. Addon files are copied to the addon store
 2. Dependencies are resolved recursively (depth-first)
-3. Each newly-installed dep's `install` hook runs (after its own sub-deps are done)
+3. Each newly-installed persistent dep's `install` hook runs (after its own sub-deps are done)
 4. The target addon's `install` hook runs last
 
 For `configurer update`:
@@ -161,6 +164,8 @@ my-addon --verbose
 ```
 
 On first install, the `commands` directory is added to the user's PATH automatically (requires a terminal restart to take effect). On uninstall, the corresponding shim is removed.
+
+Install-less runs use a separate temporary command directory for their dependencies. It is added only to the current run's `PATH` and removed with the temporary dependency store afterward.
 
 ## Examples
 
@@ -203,7 +208,7 @@ my-addon --verbose --target=prod
 3. **Resolve target** - GitHub subpath, git URL, local path, installed name, or official repo
 4. **Validate manifest** - parses `.configurer.yml`, checks `apiVersion`, required fields
 5. **Install/Run** - copies to addon store (install) or executes entrypoint (run)
-6. **Resolve dependencies** - recursively installs/updates any missing or outdated deps, running their lifecycle hooks depth-first
+6. **Resolve dependencies** - recursively installs/updates persistent deps, or temporarily fetches deps for an install-less run
 7. **Run lifecycle hook** - executes the addon's `install`/`update`/`uninstall` hook as appropriate
 8. **Create command shim** - writes a `.bat` shim so the addon is callable by name
 9. **Ensure PATH** - adds the commands directory to the user's PATH if not already present
